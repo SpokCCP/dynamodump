@@ -34,9 +34,6 @@ try:
 except ImportError:
     from urllib2 import urlopen, URLError, HTTPError
 
-import boto.dynamodb2.layer1
-from boto.dynamodb2.exceptions import ProvisionedThroughputExceededException
-import botocore
 import boto3
 
 
@@ -75,12 +72,12 @@ def _get_aws_client(profile, region, service):
             azone = urlopen(METADATA_URL + "placement/availability-zone",
                             data=None, timeout=5).read().decode()
             aws_region = azone[:-1]
-        except URLError:
-            logging.exception("Timed out connecting to metadata service.\n\n")
-            sys.exit(1)
         except HTTPError as e:
             logging.exception("Error determining region used for AWS client.  Typo in code?\n\n" +
                               str(e))
+            sys.exit(1)
+        except URLError:
+            logging.exception("Timed out connecting to metadata service.\n\n")
             sys.exit(1)
 
     if profile:
@@ -144,7 +141,7 @@ def do_put_bucket_object(profile, region, bucket, bucket_object):
                        ExtraArgs={
                            "ServerSideEncryption": "AES256"
                        })
-    except botocore.exceptions.ClientError as e:
+    except Exception as e:
         logging.exception("Failed to put file to S3 bucket\n\n" + str(e))
         sys.exit(1)
 
@@ -170,7 +167,7 @@ def do_get_s3_archive(profile, region, bucket, table, archive):
         s3.head_bucket(
             Bucket=bucket
         )
-    except botocore.exceptions.ClientError as e:
+    except Exception as e:
         logging.exception("S3 bucket " + bucket + " does not exist. "
                           "Can't get backup file\n\n" + str(e))
         sys.exit(1)
@@ -180,7 +177,7 @@ def do_get_s3_archive(profile, region, bucket, table, archive):
             Bucket=bucket,
             Prefix=args.dumpPath
         )
-    except botocore.exceptions.ClientError as e:
+    except Exception as e:
         logging.exception("Issue listing contents of bucket " + bucket + "\n\n" + str(e))
         sys.exit(1)
 
@@ -352,44 +349,33 @@ def delete_table(conn, sleep_interval, table_name):
     """
 
     if not args.dataOnly:
+        table_exist = True
         while True:
             # delete table if exists
-            table_exist = True
             try:
-                conn.delete_table(table_name)
-            except boto.exception.JSONResponseError as e:
-                if e.body["__type"] == "com.amazonaws.dynamodb.v20120810#ResourceNotFoundException":
-                    table_exist = False
-                    logging.info(table_name + " table deleted!")
-                    break
-                elif e.body["__type"] == "com.amazonaws.dynamodb.v20120810#LimitExceededException":
-                    logging.info("Limit exceeded, retrying deletion of " + table_name + "..")
-                    time.sleep(sleep_interval)
-                elif e.body["__type"] == "com.amazon.coral.availability#ThrottlingException":
-                    logging.info("Control plane limit exceeded, retrying deletion of " +
-                                 table_name + "..")
-                    time.sleep(sleep_interval)
-                elif e.body["__type"] == "com.amazonaws.dynamodb.v20120810#ResourceInUseException":
-                    logging.info(table_name + " table is being deleted..")
-                    time.sleep(sleep_interval)
-                else:
-                    logging.exception(e)
-                    sys.exit(1)
+                conn.delete_table(TableName=table_name)
+            except conn.exceptions.ResourceNotFoundException as e:
+                logging.info("%s did not exist" % table_name)
+                table_exist = False
+                break
+            except conn.exceptions.ResourceInUseException as e:
+                break
+            except Exception as ex:
+                logging.exception(ex)
+                sys.exit(1)
 
         # if table exists, wait till deleted
         if table_exist:
             try:
                 while True:
                     logging.info("Waiting for " + table_name + " table to be deleted.. [" +
-                                 conn.describe_table(table_name)["Table"]["TableStatus"] + "]")
+                                 conn.describe_table(TableName=table_name)["Table"]["TableStatus"] + "]")
                     time.sleep(sleep_interval)
-            except boto.exception.JSONResponseError as e:
-                if e.body["__type"] == "com.amazonaws.dynamodb.v20120810#ResourceNotFoundException":
-                    logging.info(table_name + " table deleted.")
-                    pass
-                else:
-                    logging.exception(e)
-                    sys.exit(1)
+            except conn.exceptions.ResourceNotFoundException as e:
+                logging.info("%s table deleted." % table_name)
+            except Exception as e:
+                logging.exception(e)
+                sys.exit(1)
 
 
 def mkdir_p(path):
@@ -415,7 +401,7 @@ def batch_write(conn, sleep_interval, table_name, put_requests):
     i = 1
     sleep = sleep_interval
     while True:
-        response = conn.batch_write_item(request_items)
+        response = conn.batch_write_item(RequestItems=request_items)
         unprocessed_items = response["UnprocessedItems"]
 
         if len(unprocessed_items) == 0:
@@ -441,9 +427,9 @@ def wait_for_active_table(conn, table_name, verb):
     """
 
     while True:
-        if conn.describe_table(table_name)["Table"]["TableStatus"] != "ACTIVE":
+        if conn.describe_table(TableName=table_name)["Table"]["TableStatus"] != "ACTIVE":
             logging.info("Waiting for " + table_name + " table to be " + verb + ".. [" +
-                         conn.describe_table(table_name)["Table"]["TableStatus"] + "]")
+                         conn.describe_table(TableName=table_name)["Table"]["TableStatus"] + "]")
             time.sleep(sleep_interval)
         else:
             logging.info(table_name + " " + verb + ".")
@@ -457,20 +443,13 @@ def update_provisioned_throughput(conn, table_name, read_capacity, write_capacit
 
     logging.info("Updating " + table_name + " table read capacity to: " +
                  str(read_capacity) + ", write capacity to: " + str(write_capacity))
-    while True:
-        try:
-            conn.update_table(table_name,
-                              {"ReadCapacityUnits": int(read_capacity),
-                               "WriteCapacityUnits": int(write_capacity)})
-            break
-        except boto.exception.JSONResponseError as e:
-            if e.body["__type"] == "com.amazonaws.dynamodb.v20120810#LimitExceededException":
-                logging.info("Limit exceeded, retrying updating throughput of " + table_name + "..")
-                time.sleep(sleep_interval)
-            elif e.body["__type"] == "com.amazon.coral.availability#ThrottlingException":
-                logging.info("Control plane limit exceeded, retrying updating throughput"
-                             "of " + table_name + "..")
-                time.sleep(sleep_interval)
+    conn.update_table(
+        TableName=table_name,
+        ProvisionedThroughput={
+            "ReadCapacityUnits": int(read_capacity),
+            "WriteCapacityUnits": int(write_capacity)
+        }
+    )
 
     # wait for provisioned throughput update completion
     if wait:
@@ -496,9 +475,6 @@ def do_empty(dynamo, table_name):
     table_local_secondary_indexes = table_desc.get("LocalSecondaryIndexes")
     table_global_secondary_indexes = table_desc.get("GlobalSecondaryIndexes")
 
-    table_provisioned_throughput = {"ReadCapacityUnits": int(original_read_capacity),
-                                    "WriteCapacityUnits": int(original_write_capacity)}
-
     logging.info("Deleting Table " + table_name)
 
     delete_table(dynamo, sleep_interval, table_name)
@@ -507,21 +483,26 @@ def do_empty(dynamo, table_name):
 
     while True:
         try:
-            dynamo.create_table(table_attribute_definitions, table_name, table_key_schema,
-                                table_provisioned_throughput, table_local_secondary_indexes,
-                                table_global_secondary_indexes)
-            break
-        except boto.exception.JSONResponseError as e:
-            if e.body["__type"] == "com.amazonaws.dynamodb.v20120810#LimitExceededException":
-                logging.info("Limit exceeded, retrying creation of " + table_name + "..")
-                time.sleep(sleep_interval)
-            elif e.body["__type"] == "com.amazon.coral.availability#ThrottlingException":
-                logging.info("Control plane limit exceeded, retrying creation of " +
-                             table_name + "..")
-                time.sleep(sleep_interval)
+            params = {
+                'AttributeDefinitions': table_attribute_definitions,
+                'TableName': table_name,
+                'KeySchema': table_key_schema
+            }
+            if args.ondemand:
+                params['BillingMode'] = 'PAY_PER_REQUEST'
             else:
-                logging.exception(e)
-                sys.exit(1)
+                # TODO: Make sure these are set right
+                params['ReadCapacityUnits'] = original_read_capacity
+                params['WriteCapacityUnits'] = original_write_capacity
+            if table_local_secondary_indexes:
+                params['LocalSecondaryIndexes'] = table_local_secondary_indexes
+            if table_global_secondary_indexes:
+                params['GlobalSecondaryIndexes'] = table_global_secondary_indexes
+            dynamo.create_table(**params)
+            break
+        except Exception as e:
+            logging.exception(e)
+            sys.exit(1)
 
     # wait for table creation completion
     wait_for_active_table(dynamo, table_name, "created")
@@ -554,20 +535,27 @@ def do_backup(dynamo, read_capacity, tableQueue=None, srcTable=None):
             # get table schema
             logging.info("Dumping table schema for " + table_name)
             f = open(args.dumpPath + os.sep + table_name + os.sep + SCHEMA_FILE, "w+")
-            table_desc = dynamo.describe_table(table_name)
+            table_desc = dynamo.describe_table(TableName=table_name).copy()
+            table_desc['Table']['BillingModeSummary']['LastUpdateToPayPerRequestDateTime'] = \
+                table_desc['Table']['BillingModeSummary']['LastUpdateToPayPerRequestDateTime'].timestamp()
+            table_desc['Table']['CreationDateTime'] = table_desc['Table']['CreationDateTime'].timestamp()
             f.write(json.dumps(table_desc, indent=JSON_INDENT))
             f.close()
 
             if not args.schemaOnly:
-                original_read_capacity = \
-                    table_desc["Table"]["ProvisionedThroughput"]["ReadCapacityUnits"]
-                original_write_capacity = \
-                    table_desc["Table"]["ProvisionedThroughput"]["WriteCapacityUnits"]
 
-                # override table read capacity if specified
-                if read_capacity is not None and read_capacity != original_read_capacity:
-                    update_provisioned_throughput(dynamo, table_name,
-                                                  read_capacity, original_write_capacity)
+                original_read_capacity = None
+                original_write_capacity = None
+                if not args.ondemand:
+                    original_read_capacity = \
+                        table_desc["Table"]["ProvisionedThroughput"]["ReadCapacityUnits"]
+                    original_write_capacity = \
+                        table_desc["Table"]["ProvisionedThroughput"]["WriteCapacityUnits"]
+
+                    # override table read capacity if specified
+                    if read_capacity is not None and read_capacity != original_read_capacity:
+                        update_provisioned_throughput(dynamo, table_name,
+                                                      read_capacity, original_write_capacity)
 
                 # get table data
                 logging.info("Dumping table items for " + table_name)
@@ -577,13 +565,13 @@ def do_backup(dynamo, read_capacity, tableQueue=None, srcTable=None):
                 last_evaluated_key = None
 
                 while True:
-                    try:
-                        scanned_table = dynamo.scan(table_name,
-                                                    exclusive_start_key=last_evaluated_key)
-                    except ProvisionedThroughputExceededException:
-                        logging.error("EXCEEDED THROUGHPUT ON TABLE " +
-                                      table_name + ".  BACKUP FOR IT IS USELESS.")
-                        tableQueue.task_done()
+                    params = {
+                        'TableName': table_name
+                    }
+                    if last_evaluated_key:
+                        params['ExclusiveStartKey'] = last_evaluated_key
+                    scanned_table = dynamo.scan(**params)
+                    tableQueue.task_done()
 
                     f = open(
                         args.dumpPath + os.sep + table_name + os.sep + DATA_DIR + os.sep +
@@ -600,7 +588,7 @@ def do_backup(dynamo, read_capacity, tableQueue=None, srcTable=None):
                         break
 
                 # revert back to original table read capacity if specified
-                if read_capacity is not None and read_capacity != original_read_capacity:
+                if not args.ondemand and read_capacity is not None and read_capacity != original_read_capacity:
                     update_provisioned_throughput(dynamo,
                                                   table_name,
                                                   original_read_capacity,
@@ -639,8 +627,20 @@ def do_restore(dynamo, sleep_interval, source_table, destination_table, write_ca
     table_key_schema = table["KeySchema"]
     original_read_capacity = table["ProvisionedThroughput"]["ReadCapacityUnits"]
     original_write_capacity = table["ProvisionedThroughput"]["WriteCapacityUnits"]
-    table_local_secondary_indexes = table.get("LocalSecondaryIndexes")
-    table_global_secondary_indexes = table.get("GlobalSecondaryIndexes")
+
+    table_local_secondary_indexes = None
+    if 'LocalSecondaryIndexes' in table:
+        table_local_secondary_indexes = [
+            {'IndexName': ix['IndexName'], 'KeySchema': ix['KeySchema'], 'Projection': ix['Projection']}
+            for ix in table.get("LocalSecondaryIndexes")
+        ]
+
+    table_global_secondary_indexes = None
+    if 'GlobalSecondaryIndexes' in table:
+        table_global_secondary_indexes = [
+            {'IndexName': ix['IndexName'], 'KeySchema': ix['KeySchema'], 'Projection': ix['Projection']}
+            for ix in table.get("GlobalSecondaryIndexes")
+        ]
 
     # override table write capacity if specified, else use RESTORE_WRITE_CAPACITY if original
     # write capacity is lower
@@ -660,10 +660,6 @@ def do_restore(dynamo, sleep_interval, source_table, destination_table, write_ca
             if gsi["ProvisionedThroughput"]["WriteCapacityUnits"] < int(write_capacity):
                 gsi["ProvisionedThroughput"]["WriteCapacityUnits"] = int(write_capacity)
 
-    # temp provisioned throughput for restore
-    table_provisioned_throughput = {"ReadCapacityUnits": int(original_read_capacity),
-                                    "WriteCapacityUnits": int(write_capacity)}
-
     if not args.dataOnly:
 
         logging.info("Creating " + destination_table + " table with temp write capacity of " +
@@ -671,19 +667,24 @@ def do_restore(dynamo, sleep_interval, source_table, destination_table, write_ca
 
         while True:
             try:
-                dynamo.create_table(table_attribute_definitions, table_table_name, table_key_schema,
-                                    table_provisioned_throughput, table_local_secondary_indexes,
-                                    table_global_secondary_indexes)
-                break
-            except boto.exception.JSONResponseError as e:
-                if e.body["__type"] == "com.amazonaws.dynamodb.v20120810#LimitExceededException":
-                    logging.info("Limit exceeded, retrying creation of " + destination_table + "..")
-                    time.sleep(sleep_interval)
-                elif e.body["__type"] == "com.amazon.coral.availability#ThrottlingException":
-                    logging.info("Control plane limit exceeded, "
-                                 "retrying creation of " + destination_table + "..")
-                    time.sleep(sleep_interval)
+                params = {
+                    'AttributeDefinitions': table_attribute_definitions,
+                    'TableName': table_table_name,
+                    'KeySchema': table_key_schema
+                }
+                if args.ondemand:
+                    params['BillingMode'] = 'PAY_PER_REQUEST'
                 else:
+                    # TODO: Make sure these are set right
+                    params['ReadCapacityUnits'] = original_read_capacity
+                    params['WriteCapacityUnits'] = write_capacity
+                if table_local_secondary_indexes:
+                    params['LocalSecondaryIndexes'] = table_local_secondary_indexes
+                if table_global_secondary_indexes:
+                    params['GlobalSecondaryIndexes'] = table_global_secondary_indexes
+                dynamo.create_table(**params)
+                break
+            except Exception as e:
                     logging.exception(e)
                     sys.exit(1)
 
@@ -691,7 +692,7 @@ def do_restore(dynamo, sleep_interval, source_table, destination_table, write_ca
         wait_for_active_table(dynamo, destination_table, "created")
     else:
         # update provisioned capacity
-        if int(write_capacity) > original_write_capacity:
+        if not args.ondemand and int(write_capacity) > original_write_capacity:
             update_provisioned_throughput(dynamo,
                                           destination_table,
                                           original_read_capacity,
@@ -731,7 +732,7 @@ def do_restore(dynamo, sleep_interval, source_table, destination_table, write_ca
             if len(put_requests) > 0:
                 batch_write(dynamo, BATCH_WRITE_SLEEP_INTERVAL, destination_table, put_requests)
 
-        if not args.skipThroughputUpdate:
+        if not (args.skipThroughputUpdate or args.ondemand):
             # revert to original table write capacity if it has been modified
             if int(write_capacity) != original_write_capacity:
                 update_provisioned_throughput(dynamo,
@@ -761,24 +762,8 @@ def do_restore(dynamo, sleep_interval, source_table, destination_table, write_ca
 
                 logging.info("Updating " + destination_table +
                              " global secondary indexes write capacities as necessary..")
-                while True:
-                    try:
-                        dynamo.update_table(destination_table,
-                                            global_secondary_index_updates=gsi_data)
-                        break
-                    except boto.exception.JSONResponseError as e:
-                        if (e.body["__type"] ==
-                                "com.amazonaws.dynamodb.v20120810#LimitExceededException"):
-                            logging.info(
-                                "Limit exceeded, retrying updating throughput of"
-                                "GlobalSecondaryIndexes in " + destination_table + "..")
-                            time.sleep(sleep_interval)
-                        elif (e.body["__type"] ==
-                              "com.amazon.coral.availability#ThrottlingException"):
-                            logging.info(
-                                "Control plane limit exceeded, retrying updating throughput of"
-                                "GlobalSecondaryIndexes in " + destination_table + "..")
-                            time.sleep(sleep_interval)
+                dynamo.update_table(destination_table,
+                                    global_secondary_index_updates=gsi_data)
 
         # wait for table to become active
         wait_for_active_table(dynamo, destination_table, "active")
@@ -792,7 +777,7 @@ def do_restore(dynamo, sleep_interval, source_table, destination_table, write_ca
 
 
 class DynamoDump(object):
-    
+
     def __init__(self, args):
         self.args = args
 
@@ -801,26 +786,10 @@ class DynamoDump(object):
             logging.info("Options --schemaOnly and --dataOnly are mutually exclusive.")
             sys.exit(1)
 
-        self.conn = AWS_SLEEP_INTERVAL
+        self.sleep_interval = AWS_SLEEP_INTERVAL
 
         # instantiate connection
-        if args.region == LOCAL_REGION:
-            self.conn = boto.dynamodb2.layer1.DynamoDBConnection(aws_access_key_id=args.accessKey,
-                                                            aws_secret_access_key=args.secretKey,
-                                                            host=args.host,
-                                                            port=int(args.port),
-                                                            is_secure=False)
-            self.sleep_interval = LOCAL_SLEEP_INTERVAL
-        elif not args.profile:
-            self.conn = boto.dynamodb2.connect_to_region(args.region, aws_access_key_id=args.accessKey,
-                                                    aws_secret_access_key=args.secretKey)
-        else:
-            self.conn = boto.dynamodb2.connect_to_region(args.region, profile_name=args.profile)
-           
-        # don't proceed if connection is not established
-        if not self.conn:
-            logging.info("Unable to establish connection with dynamodb")
-            sys.exit(1)
+        self.conn = _get_aws_client(args.profile, args.region, 'dynamodb')
 
         # set prefix separator
         self.prefix_separator = DEFAULT_PREFIX_SEPARATOR
@@ -828,12 +797,12 @@ class DynamoDump(object):
             self.prefix_separator = args.prefixSeparator
         if args.noSeparator is True:
             self.prefix_separator = None
-    
+
         # TODO: Make these not global
         global sleep_interval, start_time
         sleep_interval = self.sleep_interval
         start_time = datetime.datetime.now().replace(microsecond=0)
-        
+
     def empty(self):
         conn = self.conn
         srcTable = self.args.srcTable
@@ -858,7 +827,7 @@ class DynamoDump(object):
             thread.join()
 
         logging.info("Empty of table(s) " + srcTable + " completed!")
-    
+
     def backup(self):
         conn = self.conn
         args = self.args
@@ -932,7 +901,7 @@ class DynamoDump(object):
                     do_put_bucket_object(args.profile, args.region, args.bucket, archive_file)
 
         pass
-    
+
     def restore(self):
         conn = self.conn
         prefix_separator = self.prefix_separator
@@ -945,10 +914,10 @@ class DynamoDump(object):
 
         # If backups are in S3 download and extract the backup to use during restoration
         if self.args.bucket:
-            do_get_s3_archive(self.args.profile, 
-                              self.args.region, 
-                              self.args.bucket, 
-                              self.args.srcTable, 
+            do_get_s3_archive(self.args.profile,
+                              self.args.region,
+                              self.args.bucket,
+                              self.args.srcTable,
                               self.args.archive)
 
         if dest_table.find("*") != -1:
@@ -1049,6 +1018,8 @@ def main():
     parser.add_argument("--readCapacity",
                         help="Change the temp read capacity of the DynamoDB table to backup "
                         "from [optional]")
+    parser.add_argument('--ondemand', action='store_true',
+                        help='Use DynamoDB ondemand, do not set or read capacities')
     parser.add_argument("-t", "--tag", help="Tag to use for identifying tables to back up.  "
                         "Mutually exclusive with srcTable.  Provided as KEY=VALUE")
     parser.add_argument("--writeCapacity",
