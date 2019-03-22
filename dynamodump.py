@@ -235,7 +235,7 @@ def do_archive(archive_type, dump_path):
         try:
             logging.info("Creating tar file " + archive + "...")
             with tarfile.open(name=archive, mode="w:bz2") as a:
-                for root, dirs, files in os.walk(archive_base):
+                for root, _, files in os.walk(archive_base):
                     for file in files:
                         a.add(os.path.join(root, file))
                 return True, archive
@@ -252,7 +252,7 @@ def do_archive(archive_type, dump_path):
             logging.info("Creating zip file...")
             archive = archive_base + ".zip"
             with zipfile.ZipFile(archive, "w") as z:
-                for root, dirs, files in os.walk(archive_base):
+                for root, _, files in os.walk(archive_base):
                     for file in files:
                         z.write(os.path.join(root, file))
                 return True, archive
