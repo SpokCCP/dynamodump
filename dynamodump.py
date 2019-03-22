@@ -350,23 +350,23 @@ def delete_table(conn, sleep_interval, table_name):
 
     if not args.dataOnly:
         table_exist = True
-        while True:
-            # delete table if exists
-            try:
-                conn.delete_table(TableName=table_name)
-            except conn.exceptions.ResourceNotFoundException as e:
-                logging.info("%s did not exist" % table_name)
-                table_exist = False
-                break
-            except conn.exceptions.ResourceInUseException as e:
-                break
-            except Exception as ex:
-                logging.exception(ex)
-                sys.exit(1)
+        # delete table if exists
+        try:
+            conn.delete_table(TableName=table_name)
+        except conn.exceptions.ResourceNotFoundException as e:
+            logging.info("%s did not exist" % table_name)
+            table_exist = False
+        except conn.exceptions.ResourceInUseException as e:
+            logging.warn('%s is in use and cannot be deleted right now' % table_name)
+            sys.exit(1)
+        except Exception as ex:
+            logging.exception(ex)
+            sys.exit(1)
 
         # if table exists, wait till deleted
         if table_exist:
             try:
+                wait_for_active_table(conn, table_name, 'delete')
                 while True:
                     logging.info("Waiting for " + table_name + " table to be deleted.. [" +
                                  conn.describe_table(TableName=table_name)["Table"]["TableStatus"] + "]")
@@ -481,28 +481,26 @@ def do_empty(dynamo, table_name):
 
     logging.info("Creating Table " + table_name)
 
-    while True:
-        try:
-            params = {
-                'AttributeDefinitions': table_attribute_definitions,
-                'TableName': table_name,
-                'KeySchema': table_key_schema
-            }
-            if args.ondemand:
-                params['BillingMode'] = 'PAY_PER_REQUEST'
-            else:
-                # TODO: Make sure these are set right
-                params['ReadCapacityUnits'] = original_read_capacity
-                params['WriteCapacityUnits'] = original_write_capacity
-            if table_local_secondary_indexes:
-                params['LocalSecondaryIndexes'] = table_local_secondary_indexes
-            if table_global_secondary_indexes:
-                params['GlobalSecondaryIndexes'] = table_global_secondary_indexes
-            dynamo.create_table(**params)
-            break
-        except Exception as e:
-            logging.exception(e)
-            sys.exit(1)
+    try:
+        params = {
+            'AttributeDefinitions': table_attribute_definitions,
+            'TableName': table_name,
+            'KeySchema': table_key_schema
+        }
+        if args.ondemand:
+            params['BillingMode'] = 'PAY_PER_REQUEST'
+        else:
+            # TODO: Make sure these are set right
+            params['ReadCapacityUnits'] = original_read_capacity
+            params['WriteCapacityUnits'] = original_write_capacity
+        if table_local_secondary_indexes:
+            params['LocalSecondaryIndexes'] = table_local_secondary_indexes
+        if table_global_secondary_indexes:
+            params['GlobalSecondaryIndexes'] = table_global_secondary_indexes
+        dynamo.create_table(**params)
+    except Exception as e:
+        logging.exception(e)
+        sys.exit(1)
 
     # wait for table creation completion
     wait_for_active_table(dynamo, table_name, "created")
@@ -665,28 +663,26 @@ def do_restore(dynamo, sleep_interval, source_table, destination_table, write_ca
         logging.info("Creating " + destination_table + " table with temp write capacity of " +
                      str(write_capacity))
 
-        while True:
-            try:
-                params = {
-                    'AttributeDefinitions': table_attribute_definitions,
-                    'TableName': table_table_name,
-                    'KeySchema': table_key_schema
-                }
-                if args.ondemand:
-                    params['BillingMode'] = 'PAY_PER_REQUEST'
-                else:
-                    # TODO: Make sure these are set right
-                    params['ReadCapacityUnits'] = original_read_capacity
-                    params['WriteCapacityUnits'] = write_capacity
-                if table_local_secondary_indexes:
-                    params['LocalSecondaryIndexes'] = table_local_secondary_indexes
-                if table_global_secondary_indexes:
-                    params['GlobalSecondaryIndexes'] = table_global_secondary_indexes
-                dynamo.create_table(**params)
-                break
-            except Exception as e:
-                    logging.exception(e)
-                    sys.exit(1)
+        try:
+            params = {
+                'AttributeDefinitions': table_attribute_definitions,
+                'TableName': table_table_name,
+                'KeySchema': table_key_schema
+            }
+            if args.ondemand:
+                params['BillingMode'] = 'PAY_PER_REQUEST'
+            else:
+                # TODO: Make sure these are set right
+                params['ReadCapacityUnits'] = original_read_capacity
+                params['WriteCapacityUnits'] = write_capacity
+            if table_local_secondary_indexes:
+                params['LocalSecondaryIndexes'] = table_local_secondary_indexes
+            if table_global_secondary_indexes:
+                params['GlobalSecondaryIndexes'] = table_global_secondary_indexes
+            dynamo.create_table(**params)
+        except Exception as e:
+                logging.exception(e)
+                sys.exit(1)
 
         # wait for table creation completion
         wait_for_active_table(dynamo, destination_table, "created")
